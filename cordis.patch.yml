@@ -1,0 +1,12 @@
+# The loader is lightweight at startup: it registers only /obu. The MCP client,
+# OBU tool schemas, and runtime skill are mounted inside the invoking agent scope
+# after /obu is executed, then removed by /obu off or session disposal.
+- insert:
+    - id: obu-loader
+      name: dsh-obu-loader
+      config:
+        # command is auto-discovered on Windows from the OBU setup/global npm install.
+        # Set an absolute open-browser-use.exe path here only for a custom install.
+        baseArgs: [mcp]
+        toolCallTimeoutMs: 60000
+        failOnStartupError: true
