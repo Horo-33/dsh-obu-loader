@@ -11,6 +11,7 @@ export interface Config {
     profile?: string;
     socketDir?: string;
     toolCallTimeoutMs: number;
+    finalizeTimeoutMs: number;
     failOnStartupError: boolean;
     reconnect: {
         enabled: boolean;
@@ -27,6 +28,7 @@ export declare const Config: z<Schemastery.ObjectS<{
     profile: z<string, string>;
     socketDir: z<string, string>;
     toolCallTimeoutMs: z<number, number>;
+    finalizeTimeoutMs: z<number, number>;
     failOnStartupError: z<boolean, boolean>;
     reconnect: z<Schemastery.ObjectS<{
         enabled: z<boolean, boolean>;
@@ -47,6 +49,7 @@ export declare const Config: z<Schemastery.ObjectS<{
     profile: z<string, string>;
     socketDir: z<string, string>;
     toolCallTimeoutMs: z<number, number>;
+    finalizeTimeoutMs: z<number, number>;
     failOnStartupError: z<boolean, boolean>;
     reconnect: z<Schemastery.ObjectS<{
         enabled: z<boolean, boolean>;
@@ -64,6 +67,7 @@ export declare const Config: z<Schemastery.ObjectS<{
 interface LoaderDependencies {
     readonly mcpPlugin: Plugin;
     readonly loadSkill: (skillPath?: string) => Promise<SkillRegistration>;
+    readonly finalizeBrowserSession?: typeof finalizeBrowserSession;
 }
 /**
  * Resolve the OBU executable without embedding a user-specific path.
@@ -81,6 +85,7 @@ export declare function identityForAgent(agentId: string): {
 };
 export declare function buildMcpArgs(config: Config, browserSessionId: string): string[];
 export declare function loadObuSkill(skillPath?: string): Promise<SkillRegistration>;
+export declare function finalizeBrowserSession(ctx: Context, command: string, config: Config, browserSessionId: string): Promise<void>;
 export declare function createLoaderPlugin(dependencies?: LoaderDependencies): Plugin.Object<Config>;
 export declare function apply(ctx: Context, config: Config): void;
 export {};

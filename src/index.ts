@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
@@ -14,12 +13,16 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import * as McpClient from '@deepseek-ai/dsh-mcp-client'
 import { renderSkillContent, type SkillRegistration } from '@deepseek-ai/dsh-skill'
 import { scopeOf } from '@deepseek-ai/dsh-scope'
+import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import z from '@deepseek-ai/schemastery'
 
 export const name = 'obu-loader'
-export const inject = ['commands', 'skills', 'tools']
+export const inject = ['commands', 'skills', 'tools', 'subprocess']
 
 const DEFAULT_TOOL_TIMEOUT_MS = 60_000
+const DEFAULT_FINALIZE_TIMEOUT_MS = 15_000
+const FINALIZE_KILL_GRACE_MS = 2_000
+const FINALIZE_STDERR_MAX_BYTES = 4_096
 const DEFAULT_RECONNECT = Object.freeze({
   enabled: true,
   initialDelayMs: 500,
@@ -34,6 +37,7 @@ export interface Config {
   profile?: string
   socketDir?: string
   toolCallTimeoutMs: number
+  finalizeTimeoutMs: number
   failOnStartupError: boolean
   reconnect: {
     enabled: boolean
@@ -51,6 +55,7 @@ export const Config = z.object({
   profile: z.string(),
   socketDir: z.string(),
   toolCallTimeoutMs: z.number().min(1).default(DEFAULT_TOOL_TIMEOUT_MS),
+  finalizeTimeoutMs: z.number().min(1).default(DEFAULT_FINALIZE_TIMEOUT_MS),
   failOnStartupError: z.boolean().default(true),
   reconnect: z.object({
     enabled: z.boolean().default(DEFAULT_RECONNECT.enabled),
@@ -71,14 +76,18 @@ interface LoaderState {
   readonly toolPrefix: string
   phase: LoaderPhase
   fiber?: Fiber
-  operation?: Promise<void>
+  startPromise?: Promise<void>
+  stopPromise?: Promise<boolean>
+  startAbort: AbortController
   disposeAgentCleanup?: () => Promise<void> | void
+  suppressAgentCleanup: boolean
   error?: Error
 }
 
 interface LoaderDependencies {
   readonly mcpPlugin: Plugin
   readonly loadSkill: (skillPath?: string) => Promise<SkillRegistration>
+  readonly finalizeBrowserSession?: typeof finalizeBrowserSession
 }
 
 const runtimeSkillProvider = 'dsh-obu-loader'
@@ -227,31 +236,65 @@ function selectorSummary(config: Config): string {
   return selectors.length ? selectors.join(', ') : 'OBU automatic target discovery'
 }
 
-async function finalizeBrowserSession(command: string, config: Config, browserSessionId: string): Promise<void> {
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('OBU activation cancelled')
+}
+
+function currentSubprocess(ctx: Context): SubprocessRuntime | undefined {
+  const candidate = (ctx as Context & { subprocess?: SubprocessRuntime }).subprocess
+  return candidate && typeof candidate.spawn === 'function' ? candidate : undefined
+}
+
+export async function finalizeBrowserSession(
+  ctx: Context,
+  command: string,
+  config: Config,
+  browserSessionId: string,
+): Promise<void> {
+  const subprocess = currentSubprocess(ctx)
+  if (!subprocess) throw new Error('DSH subprocess service is unavailable; refusing to spawn finalize-tabs with an ambient environment')
+
   const args = ['finalize-tabs', '--session-id', browserSessionId]
   if (config.browser) args.push('--browser', config.browser)
   if (config.profile) args.push('--profile', config.profile)
   if (config.socketDir) args.push('--socket-dir', config.socketDir)
   args.push('--keep', '[]')
-  await new Promise<void>((resolvePromise, reject) => {
-    const child = spawn(command, args, {
-      cwd: undefined,
-      env: process.env,
-      shell: false,
-      stdio: ['ignore', 'ignore', 'pipe'],
-      windowsHide: true,
-    })
-    let stderr = ''
-    child.stderr?.setEncoding('utf8')
-    child.stderr?.on('data', (chunk: string) => {
-      if (stderr.length < 4096) stderr += chunk
-    })
-    child.once('error', reject)
-    child.once('close', (code) => {
-      if (code === 0) resolvePromise()
-      else reject(new Error(`OBU finalize-tabs exited with code ${code ?? 'unknown'}${stderr.trim() ? `: ${stderr.trim()}` : ''}`))
-    })
+
+  const deadline = new AbortController()
+  const timer = setTimeout(() => deadline.abort(new Error(`OBU finalize-tabs timed out after ${config.finalizeTimeoutMs}ms`)), config.finalizeTimeoutMs)
+  timer.unref?.()
+  const handle = subprocess.spawn({
+    argv: [command, ...args],
+    cwd: process.cwd(),
+    env: {},
+    signal: deadline.signal,
+    graceMs: FINALIZE_KILL_GRACE_MS,
+    stdio: {
+      stdin: 'ignore',
+      stdout: { maxBytes: 0 },
+      stderr: { maxBytes: FINALIZE_STDERR_MAX_BYTES },
+    },
   })
+
+  const timedOut = new Promise<never>((_, reject) => {
+    deadline.signal.addEventListener('abort', () => {
+      reject(deadline.signal.reason instanceof Error ? deadline.signal.reason : new Error('OBU finalize-tabs timed out'))
+    }, { once: true })
+  })
+  try {
+    const outcome = await Promise.race([handle.done, timedOut])
+    const stderr = handle.collected.stderr?.readFrom(0).text.trim() ?? ''
+    if (outcome.exitCode !== 0) {
+      throw new Error(`OBU finalize-tabs exited with code ${outcome.exitCode ?? 'unknown'}${stderr ? `: ${stderr}` : ''}`)
+    }
+  } finally {
+    clearTimeout(timer)
+    if (deadline.signal.aborted) {
+      handle.terminate()
+      const killDeadline = AbortSignal.timeout(FINALIZE_KILL_GRACE_MS * 2)
+      await handle.waitForExit(killDeadline).catch(() => false)
+    }
+  }
 }
 
 export function createLoaderPlugin(dependencies: LoaderDependencies = {
@@ -265,33 +308,67 @@ export function createLoaderPlugin(dependencies: LoaderDependencies = {
     apply(ctx, config) {
       const states = new WeakMap<Agent, LoaderState>()
       const logger = ctx.logger(name)
+      const finalize = dependencies.finalizeBrowserSession ?? finalizeBrowserSession
+
+      const deleteIfCurrent = (agent: Agent, state: LoaderState): void => {
+        if (states.get(agent) === state) states.delete(agent)
+      }
+
+      const disposeFiber = async (state: LoaderState): Promise<void> => {
+        const fiber = state.fiber
+        state.fiber = undefined
+        if (fiber) await fiber.dispose().catch((error) => {
+          logger.warn(`failed to dispose OBU fiber ${state.serverName}: ${errorText(error)}`)
+        })
+      }
+
+      const stopState = (agent: Agent, state: LoaderState, finalizeActive: boolean): Promise<boolean> => {
+        if (state.stopPromise) return state.stopPromise
+        const wasActive = state.phase === 'active'
+        state.phase = 'stopping'
+        state.startAbort.abort(new Error('OBU activation cancelled by stop'))
+
+        const stopPromise = (async () => {
+          try {
+            if (state.startPromise) await state.startPromise.catch(() => undefined)
+            if (finalizeActive && wasActive) {
+              await finalize(ctx, state.command, config, state.browserSessionId).catch((error) => {
+                logger.warn(`failed to finalize OBU browser session ${state.browserSessionId}: ${errorText(error)}`)
+              })
+            }
+          } finally {
+            await disposeFiber(state)
+            state.suppressAgentCleanup = true
+            if (state.disposeAgentCleanup) await Promise.resolve(state.disposeAgentCleanup()).catch(() => undefined)
+            deleteIfCurrent(agent, state)
+          }
+          return true
+        })()
+        state.stopPromise = stopPromise
+        return stopPromise
+      }
 
       const stop = async (agent: Agent): Promise<boolean> => {
         const state = states.get(agent)
-        if (!state) return false
-        const wasActive = state.phase === 'active'
-        state.phase = 'stopping'
-        try {
-          if (wasActive) {
-            await finalizeBrowserSession(state.command, config, state.browserSessionId).catch((error) => {
-              logger.warn(`failed to finalize OBU browser session ${state.browserSessionId}: ${errorText(error)}`)
-            })
-          }
-          if (state.fiber) await state.fiber.dispose()
-          else if (state.operation) await state.operation.catch(() => undefined)
-        } finally {
-          if (state.disposeAgentCleanup) await Promise.resolve(state.disposeAgentCleanup()).catch(() => undefined)
-          states.delete(agent)
-        }
-        return true
+        return state ? stopState(agent, state, true) : false
       }
 
       const start = async (agent: Agent): Promise<LoaderState> => {
-        const existing = states.get(agent)
-        if (existing) {
-          if (existing.operation) await existing.operation
+        while (true) {
+          const existing = states.get(agent)
+          if (!existing) break
           if (existing.phase === 'active') return existing
+          if (existing.phase === 'starting' && existing.startPromise) {
+            await existing.startPromise
+            if (states.get(agent) === existing) return existing
+            continue
+          }
+          if (existing.stopPromise) {
+            await existing.stopPromise
+            continue
+          }
           if (existing.error) throw existing.error
+          await stopState(agent, existing, false)
         }
 
         const identity = identityForAgent(String(agent.id))
@@ -301,25 +378,26 @@ export function createLoaderPlugin(dependencies: LoaderDependencies = {
           command,
           ...identity,
           phase: 'starting',
+          startAbort: new AbortController(),
+          suppressAgentCleanup: false,
         }
         states.set(agent, state)
 
         state.disposeAgentCleanup = agent.ctx.effect(() => async () => {
-          if (state.phase !== 'active') return
-          await finalizeBrowserSession(state.command, config, state.browserSessionId).catch((error) => {
-            logger.warn(`failed to finalize disposed OBU browser session ${state.browserSessionId}: ${errorText(error)}`)
-          })
-          states.delete(agent)
+          if (state.suppressAgentCleanup) return
+          state.suppressAgentCleanup = true
+          await stopState(agent, state, true)
         }, 'obu-loader.agent-cleanup')
 
-        state.operation = (async () => {
-          let fiber: Fiber | undefined
+        const startPromise = (async () => {
           try {
             const skill = await dependencies.loadSkill(config.skillPath)
-            fiber = agent.ctx.plugin({
+            throwIfAborted(state.startAbort.signal)
+            const fiber = agent.ctx.plugin({
               name: `obu-session-${state.serverName}`,
               inject: ['skills', 'tools'],
               async apply(sessionCtx) {
+                throwIfAborted(state.startAbort.signal)
                 sessionCtx.skills.register(skill)
                 await sessionCtx.plugin(dependencies.mcpPlugin, {
                   transport: 'stdio',
@@ -332,10 +410,13 @@ export function createLoaderPlugin(dependencies: LoaderDependencies = {
                   failOnStartupError: config.failOnStartupError,
                   reconnect: config.reconnect,
                 })
+                throwIfAborted(state.startAbort.signal)
               },
             })
             state.fiber = fiber
             await fiber
+            throwIfAborted(state.startAbort.signal)
+            if (states.get(agent) !== state || state.phase !== 'starting') throw new Error('OBU activation cancelled')
             state.phase = 'active'
             agent.inject(createUserMessage({
               content: [{ type: 'text', text: renderActivationInstructions(skill, state) }],
@@ -346,18 +427,22 @@ export function createLoaderPlugin(dependencies: LoaderDependencies = {
               },
             }))
           } catch (error) {
-            state.phase = 'failed'
             state.error = error instanceof Error ? error : new Error(String(error))
-            if (fiber) await fiber.dispose().catch(() => undefined)
-            if (state.disposeAgentCleanup) await Promise.resolve(state.disposeAgentCleanup()).catch(() => undefined)
-            states.delete(agent)
+            if (state.phase !== 'stopping') state.phase = 'failed'
+            await disposeFiber(state)
+            if (!state.stopPromise) {
+              state.suppressAgentCleanup = true
+              if (state.disposeAgentCleanup) await Promise.resolve(state.disposeAgentCleanup()).catch(() => undefined)
+              deleteIfCurrent(agent, state)
+            }
             throw state.error
           } finally {
-            state.operation = undefined
+            state.startPromise = undefined
           }
         })()
+        state.startPromise = startPromise
 
-        await state.operation
+        await startPromise
         return state
       }
 

@@ -1,6 +1,6 @@
 # dsh-obu-loader
 
-面向 **Windows + DeepSeek Harness 0.1.0-rc.7** 的按会话、按需 Open Browser Use 加载器。
+面向 **Windows + DeepSeek Harness 0.1.1-rc.2** 的按会话、按需 Open Browser Use 加载器。
 
 插件启动时只注册轻量 `/obu` 命令。用户在某个 DSH 会话执行 `/obu` 后，它才会为当前 Agent 启动独立的 `open-browser-use mcp` 子进程、注册 MCP 浏览器工具，并注入 Open Browser Use Skill。不同 Agent 使用不同的浏览器 session id 和 MCP 工具命名空间。
 
@@ -22,7 +22,7 @@
 
 - Windows 10/11
 - Node.js 20 或更高版本
-- DeepSeek Harness `0.1.0-rc.7`
+- DeepSeek Harness `0.1.1-rc.2`
 - Open Browser Use CLI 与对应 Chrome 扩展
 
 其他系统尚未作为本项目的发布目标验证。
@@ -127,6 +127,7 @@ GitHub 依赖包含已经编译的 `lib/`，正常安装不需要在目标电脑
 | `profile` | 未设置 | 可选 Chrome profile，如 `Default` |
 | `socketDir` | 未设置 | 可选 socket registry 目录，通常无需设置 |
 | `toolCallTimeoutMs` | `60000` | MCP 单工具调用超时 |
+| `finalizeTimeoutMs` | `15000` | `finalize-tabs` 最长等待时间；超时后通过 DSH subprocess seam 终止整个进程树 |
 | `failOnStartupError` | `true` | MCP 初始化失败时回滚激活 |
 | `reconnect` | 内置指数退避 | MCP 断线重连设置 |
 | `skillPath` | 包内 Skill | 仅用于开发时覆盖 Skill 路径 |
@@ -186,8 +187,10 @@ git status --short
 
 ## 生命周期与安全
 
-- 同一会话重复 `/obu` 是幂等操作，不会重复启动 MCP。
-- `/obu off` 会先执行 `finalize-tabs --keep []`，再关闭 MCP Fiber。
+- 同一 Agent 的 start/stop 操作严格串行；重复 `/obu` 幂等，重复 `/obu off` 共享唯一 stop Promise。
+- Agent 在 `starting` 阶段销毁或执行 `/obu off` 会取消激活，并等待已创建 Fiber 清理完成。
+- `/obu off` 会先执行带超时的 `finalize-tabs --keep []`，无论 finalize 成功、失败或超时都关闭 MCP Fiber；超时走 DSH `ctx.subprocess` 的进程树终止 fallback。
+- finalize 子进程使用 DSH 0.1.1-rc.2 公开 subprocess seam 的脱敏父环境，不隐式继承 `DSH_*` 或凭据形环境变量。
 - Agent 销毁时会 best-effort 清理对应的 OBU browser session。
 - Skill 明确禁止读取 Cookie、密码和无关浏览数据。
 - 上传文件、剪贴板、提交表单、购买、删除或发送等外部可见操作仍需用户明确许可。
